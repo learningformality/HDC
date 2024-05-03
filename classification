@@ -1,0 +1,146 @@
+import torch
+import torch.nn as nn
+import torchvision
+from torchvision.datasets import MNIST
+from torchvision.datasets import FashionMNIST
+from torchvision.datasets import CIFAR10
+from torchhd.datasets import Arrhythmia
+from torchhd.datasets import ISOLET
+import torchmetrics
+import torchhd
+from torchhd.models import Centroid
+from torchhd import embeddings
+from tqdm import tqdm
+import gdown
+
+if __name__ == "__main__":
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using {} device".format(device))
+
+    DIMENSIONS = 3000
+    IMG_SIZE = 617
+    NUM_LEVELS = 1000
+    BATCH_SIZE = 100
+    EPOCHS = 3
+    lr = 1
+    trials = 10
+    total = 0
+    vals = (DIMENSIONS, IMG_SIZE, NUM_LEVELS, EPOCHS)
+
+    transform = torchvision.transforms.ToTensor()
+
+    class Encoder(nn.Module):
+        def __init__(self, out_features, size, levels):
+
+            super(Encoder, self).__init__()
+            self.flatten = torch.nn.Flatten()
+            self.position = embeddings.Random(617, out_features)
+            self.value = embeddings.Level(levels, out_features)
+
+        def forward(self, x):
+
+            x = self.flatten(x)
+            sample_hv = torchhd.bind(self.position.weight, self.value(x))
+            sample_hv = torchhd.multiset(sample_hv)
+            return torchhd.hard_quantize(sample_hv)
+    
+    def stoch_quantize(tensor):
+
+        # Create a mask for positive values
+        pos_mask = tensor > 0
+
+        # Create a mask for negative values
+        neg_mask = tensor < 0
+
+        # Create a mask for zero values
+        zero_mask = tensor == 0
+
+        # Randomly assign 1 or -1 to zero values with 30% probability
+        rand_mask = torch.rand_like(tensor) < 0.3
+        zero_mask = torch.where(zero_mask, rand_mask, zero_mask)
+
+        # Quantize the tensor
+        quantized_tensor = torch.zeros_like(tensor)
+        quantized_tensor[pos_mask] = 1
+        quantized_tensor[neg_mask] = -1
+        quantized_tensor[zero_mask] = 1
+        quantized_tensor[~zero_mask] = -1
+
+        return quantized_tensor
+
+    def train(train_ld, train_ds, vals, lr):
+
+        model = Centroid(vals[0], len(train_ds.classes))
+        model = model.to(device)
+
+        with torch.no_grad():
+                
+            for i in range(vals[3]):
+                
+                for samples, labels in tqdm(train_ld, desc="Training"):
+
+                    samples = samples.cuda(non_blocking=True)
+                    labels = labels.cuda(non_blocking=True)
+
+                    samples_hv = encode(samples)
+                    '''
+                    
+                    logit = model(samples_hv)
+                    preds = logit.argmax(1)
+                    is_wrong = (labels != preds)
+
+                    if is_wrong.sum().item() == 0:
+                        
+                        continue
+                    
+                    else:
+
+                        samples_hv = samples_hv[is_wrong]
+                        labels = labels[is_wrong]
+                        preds = preds[is_wrong]
+      
+                        sims = torch.diagonal(torchhd.hamming_similarity(samples_hv, stoch_quantize(model.weight[torch.tensor(labels)])), 0) / vals[0]
+ 
+                        model.weight.index_add_(0, labels, torch.mul(samples_hv, sims[:, None]), alpha=lr)
+                        model.weight.index_add_(0, preds, torch.mul(samples_hv, 1 - sims[:, None]), alpha=-lr)
+                    '''
+                    model.add_adapt(samples_hv, labels, lr=lr)
+                    
+        return model
+
+
+    encode = Encoder(vals[0], vals[1], vals[2])
+    encode = encode.to(device)
+
+    for i in range(trials):
+
+        train_ds = ISOLET("../data", train=True)
+        #sampler = torch.utils.data.RandomSampler(train_ds, replacement=False, num_samples=10000)
+        train_ld = torch.utils.data.DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=3, prefetch_factor=4, persistent_workers=True, pin_memory=True)
+
+        test_ds = ISOLET("../data", train=False)
+        test_ld = torch.utils.data.DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=1, prefetch_factor=4, persistent_workers=True, pin_memory=True)
+
+        accuracy = torchmetrics.Accuracy("multiclass", num_classes=len(train_ds.classes))
+
+        model = train(train_ld, train_ds, vals, lr)
+    
+        with torch.no_grad():
+            
+            model.normalize()
+
+            for samples, labels in tqdm(test_ld, desc="Testing"):
+
+                samples = samples.cuda(non_blocking=True)
+
+                samples_hv = encode(samples)
+                outputs = model(samples_hv, dot=True)
+                accuracy.update(outputs.cpu(), labels)
+        
+        print(f"Testing accuracy of {(accuracy.compute().item() * 100):.3f}% for trial {int(i) + 1}")
+        total += accuracy.compute().item()
+        torch.cuda.empty_cache()
+        model.reset_parameters()
+
+    print(f"Testing accuracy of total: {(total * 100 / trials):.3f}%")
